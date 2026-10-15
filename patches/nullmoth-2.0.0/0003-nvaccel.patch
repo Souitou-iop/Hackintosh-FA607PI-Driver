@@ -1,0 +1,591 @@
+diff --git a/kexts/NVRM/accel/nvaccel_sensors.h b/kexts/NVRM/accel/nvaccel_sensors.h
+new file mode 100644
+index 0000000..7057f4f
+--- /dev/null
++++ b/kexts/NVRM/accel/nvaccel_sensors.h
+@@ -0,0 +1,262 @@
++// GPU sensors for system monitors (Stats, iStat Menus, ...): they read the accelerator's "PerformanceStatistics"
++// dictionary and look for "Device Utilization %" and "Temperature(C)", which only a vendor driver fills in.
++//
++// The family publishes PerformanceStatistics as an OSSerializer that builds the dictionary each time it is read.
++// NVAccel's setProperty wraps that serializer: the family's dictionary is built as before, the GPU keys are added,
++// and the result is serialized. The values come from a kernel thread that asks RM once a second, through NVRM's own
++// RM client bridge (the one NVAccel already creates for Metal clients) - the same escapes nvidia-smi's library uses:
++//   temperature  NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2 (sensor reading)
++//   load         NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2 (graphics, memory, NVENC, NVDEC; 200 ms samples)
++// RM copies control parameters with copyin/copyout; on a kernel thread (pmap == kernel_pmap) XNU's copyio reads and
++// writes kernel addresses, so plain kernel buffers work as the "user" side.
++// Boot-arg -nvsensoff: no RM client, no polling, and PerformanceStatistics stays the family's own serializer.
++#pragma once
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <kern/thread_call.h>
++#include "nvos.h"
++#include "nv_escape.h"
++#include "nv-ioctl.h"
++#include "class/cl0000.h"
++#include "class/cl0080.h"
++#include "class/cl2080.h"
++#include "ctrl/ctrl0000/ctrl0000gpu.h"
++#include "ctrl/ctrl2080/ctrl2080thermal.h"
++#include "ctrl/ctrl2080/ctrl2080perf.h"
++#include "ctrl/ctrl2080/ctrl2080gpumon.h"
++
++static constexpr uint32_t kNvSensPeriodMs = 1000, kNvSensRetryMs = 5000;
++static constexpr NvHandle kNvSensDevice = 0xcafe5e01, kNvSensSub = 0xcafe5e02;
++static constexpr int kNvSensAvg = 5;   // samples averaged: 5 x 200 ms = the last second
++
++static volatile SInt32 gNvSensTemp = -1, gNvSensGr = -1, gNvSensFb = -1, gNvSensEnc = -1, gNvSensDec = -1;
++static int gNvSensEnable = 1;   // sysctl debug.nvaccel_sensors: 0 stops asking RM and leaves PerformanceStatistics as the family's
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_sensors, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvSensEnable, 0,
++           "1 = GPU temperature and load in PerformanceStatistics (polled from RM every second); 0 = off");
++// CTLFLAG_KERN: other kexts (AsusFanSMC's TG0D) read these with sysctlbyname, which the kernel refuses without it
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_gpu_temp, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (int *)&gNvSensTemp, 0, "GPU temperature, C (-1 = unknown)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_gpu_util, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (int *)&gNvSensGr, 0, "GPU graphics engine load, % (-1 = unknown)");
++static struct {
++    thread_call_t call;
++    IOUserClient *uc;
++    NvHandle      hClient;
++    bool          up, off;
++    unsigned      failRun, logged;
++    NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS               *tp;
++    NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS *util;
++} gNvSens;
++
++#define SLOG(fmt, ...) do { if (gNvSens.logged < 24) { gNvSens.logged++; ALOG("sensors: " fmt, ##__VA_ARGS__); } } while (0)
++
++static IOReturn nvSensEsc(uint32_t cmd, void *p, uint32_t size)
++{
++    uint64_t in = cmd;
++    IOExternalMethodArguments a;
++    bzero(&a, sizeof a);
++    a.version = kIOExternalMethodArgumentsCurrentVersion;
++    a.selector = 1;   // NVRMUserClient sEsc
++    a.scalarInput = &in; a.scalarInputCount = 1;
++    a.structureInput = p; a.structureInputSize = size;
++    a.structureOutput = p; a.structureOutputSize = size;
++    return gNvSens.uc->externalMethod(1, &a, nullptr, nullptr, nullptr);
++}
++static NvU32 nvSensCtrl(NvHandle obj, NvU32 cmd, void *params, NvU32 size)
++{
++    NVOS54_PARAMETERS p;
++    bzero(&p, sizeof p);
++    p.hClient = gNvSens.hClient; p.hObject = obj; p.cmd = cmd; p.params = (NvP64)(uintptr_t)params; p.paramsSize = size;
++    if (nvSensEsc(NV_ESC_RM_CONTROL, &p, sizeof p) != kIOReturnSuccess) return p.status ? p.status : NV_ERR_GENERIC;
++    return p.status;
++}
++static NvU32 nvSensAlloc(NvHandle parent, NvHandle obj, NvU32 cls, void *params, NvU32 size)
++{
++    NVOS21_PARAMETERS p;
++    bzero(&p, sizeof p);
++    p.hRoot = gNvSens.hClient; p.hObjectParent = parent; p.hObjectNew = obj; p.hClass = cls;
++    p.pAllocParms = (NvP64)(uintptr_t)params; p.paramsSize = size;
++    if (nvSensEsc(NV_ESC_RM_ALLOC, &p, sizeof p) != kIOReturnSuccess) return p.status ? p.status : NV_ERR_GENERIC;
++    return p.status;
++}
++static void nvSensDown(void)
++{
++    if (gNvSens.uc) {
++        if (gNvSens.hClient) {
++            NVOS00_PARAMETERS p;
++            bzero(&p, sizeof p);
++            p.hRoot = gNvSens.hClient; p.hObjectParent = gNvSens.hClient; p.hObjectOld = gNvSens.hClient;
++            nvSensEsc(NV_ESC_RM_FREE, &p, sizeof p);
++        }
++        gNvSens.uc->clientClose();
++        gNvSens.uc->release();
++    }
++    gNvSens.uc = nullptr; gNvSens.hClient = 0; gNvSens.up = false;
++    gNvSensTemp = gNvSensGr = gNvSensFb = gNvSensEnc = gNvSensDec = -1;
++}
++static bool nvSensUp(void)
++{
++    if (!gNvSens.tp)   gNvSens.tp   = (decltype(gNvSens.tp))IOMalloc(sizeof *gNvSens.tp);       // kept for the boot
++    if (!gNvSens.util) gNvSens.util = (decltype(gNvSens.util))IOMalloc(sizeof *gNvSens.util);
++    if (!gNvSens.tp || !gNvSens.util) { SLOG("no memory for the RM parameters"); return false; }
++    OSDictionary *m = IOService::serviceMatching("NVRM");
++    IOService *nvrm = m ? IOService::copyMatchingService(m) : nullptr;
++    if (m) m->release();
++    if (!nvrm) { SLOG("no NVRM service yet"); return false; }
++    const OSSymbol *fn = OSSymbol::withCStringNoCopy("nvNewAccelClient");
++    IOUserClient *uc = nullptr;
++    IOReturn r = fn ? nvrm->callPlatformFunction(fn, false, (void *)kernel_task, (void *)0 /* ctl */, &uc, nullptr) : kIOReturnNoMemory;
++    if (fn) fn->release();
++    nvrm->release();
++    if (r != kIOReturnSuccess || !uc) { SLOG("NVRM gave no RM client (0x%x)", r); return false; }
++    gNvSens.uc = uc;
++
++    NvU32 st;
++    { NVOS21_PARAMETERS p; bzero(&p, sizeof p); p.hClass = NV01_ROOT_CLIENT;
++      if (nvSensEsc(NV_ESC_RM_ALLOC, &p, sizeof p) != kIOReturnSuccess || p.status) {
++          SLOG("RM client alloc failed (status 0x%x)", p.status); nvSensDown(); return false; }
++      gNvSens.hClient = p.hObjectNew; }
++    nv_ioctl_card_info_t ci[4];
++    bzero(ci, sizeof ci);
++    if (nvSensEsc(NV_ESC_CARD_INFO, ci, sizeof ci) != kIOReturnSuccess || !ci[0].valid) { SLOG("card info failed"); nvSensDown(); return false; }
++    NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS id;
++    bzero(&id, sizeof id); id.gpuId = ci[0].gpu_id;
++    if ((st = nvSensCtrl(gNvSens.hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &id, sizeof id))) { SLOG("GET_ID_INFO_V2 0x%x", st); nvSensDown(); return false; }
++    NV0080_ALLOC_PARAMETERS a80;
++    bzero(&a80, sizeof a80); a80.deviceId = id.deviceInstance; a80.hClientShare = gNvSens.hClient;
++    if ((st = nvSensAlloc(gNvSens.hClient, kNvSensDevice, NV01_DEVICE_0, &a80, sizeof a80))) { SLOG("device alloc 0x%x", st); nvSensDown(); return false; }
++    NV2080_ALLOC_PARAMETERS a20;
++    bzero(&a20, sizeof a20); a20.subDeviceId = id.subDeviceInstance;
++    if ((st = nvSensAlloc(kNvSensDevice, kNvSensSub, NV20_SUBDEVICE_0, &a20, sizeof a20))) { SLOG("subdevice alloc 0x%x", st); nvSensDown(); return false; }
++    gNvSens.up = true;
++    SLOG("RM client 0x%x on GPU 0x%x: polling temperature and load every %u ms", gNvSens.hClient, ci[0].gpu_id, kNvSensPeriodMs);
++    return true;
++}
++static bool nvSensPoll(void)
++{
++    NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS *tp = gNvSens.tp;
++    bzero(tp, sizeof *tp);
++    tp->clientAPIVersion = THERMAL_SYSTEM_API_VER; tp->clientAPIRevision = THERMAL_SYSTEM_API_REV;
++    tp->clientInstructionSizeOf = sizeof(NV2080_CTRL_THERMAL_SYSTEM_INSTRUCTION);
++    tp->executeFlags = NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_FLAGS_IGNORE_FAIL;
++    tp->instructionListSize = 1;
++    tp->instructionList[0].opcode = NV2080_CTRL_THERMAL_SYSTEM_GET_STATUS_SENSOR_READING_OPCODE;
++    tp->instructionList[0].operands.getStatusSensorReading.sensorIndex = 0;   // sensor 0 = the GPU core
++    NvU32 st = nvSensCtrl(kNvSensSub, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, tp, sizeof *tp);
++    bool okT = !st && tp->instructionList[0].executed && !tp->instructionList[0].result;
++    NvS32 t = tp->instructionList[0].operands.getStatusSensorReading.value;
++    gNvSensTemp = (okT && t > 0 && t < 150) ? t : -1;
++    if (!okT) SLOG("temperature: status 0x%x result 0x%x", st, tp->instructionList[0].result);
++
++    NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS *u = gNvSens.util;
++    bzero(u, sizeof *u);
++    u->type = NV2080_CTRL_GPUMON_SAMPLE_TYPE_PERFMON_UTIL;
++    u->bufSize = sizeof u->samples;
++    st = nvSensCtrl(kNvSensSub, NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2, u, sizeof *u);
++    bool okU = !st;
++    if (okU) {
++        // the ring's order is RM's business: take the newest samples by timestamp
++        const int n = NV2080_CTRL_PERF_GPUMON_SAMPLE_COUNT_PERFMON_UTIL;
++        int idx[kNvSensAvg]; int got = 0;
++        for (int k = 0; k < kNvSensAvg; k++) {
++            int best = -1;
++            for (int i = 0; i < n; i++) {
++                NvU64 ts = u->samples[i].base.timeStamp;
++                if (!ts) continue;
++                bool used = false;
++                for (int j = 0; j < got; j++) if (idx[j] == i) used = true;
++                if (!used && (best < 0 || ts > u->samples[best].base.timeStamp)) best = i;
++            }
++            if (best < 0) break;
++            idx[got++] = best;
++        }
++        if (got) {
++            uint64_t gr = 0, fb = 0, enc = 0, dec = 0;
++            for (int j = 0; j < got; j++) {
++                gr += u->samples[idx[j]].gr.util; fb += u->samples[idx[j]].fb.util;
++                enc += u->samples[idx[j]].nvenc.util; dec += u->samples[idx[j]].nvdec.util;
++            }
++            // RM reports pct*100
++            gNvSensGr  = (SInt32)((gr  / (unsigned)got + 50) / 100); gNvSensFb  = (SInt32)((fb  / (unsigned)got + 50) / 100);
++            gNvSensEnc = (SInt32)((enc / (unsigned)got + 50) / 100); gNvSensDec = (SInt32)((dec / (unsigned)got + 50) / 100);
++        } else okU = false;
++    } else SLOG("load samples: status 0x%x", st);
++    if (!okU) gNvSensGr = gNvSensFb = gNvSensEnc = gNvSensDec = -1;
++    return okT || okU;
++}
++static void nvSensTick(void *, void *)
++{
++    uint32_t next = kNvSensPeriodMs;
++    if (!gNvSensEnable) {
++        if (gNvSens.up) { SLOG("debug.nvaccel_sensors=0: RM client closed"); nvSensDown(); }
++        next = kNvSensRetryMs;
++    } else if (!gNvSens.up && !nvSensUp()) next = kNvSensRetryMs;
++    else if (nvSensPoll()) gNvSens.failRun = 0;
++    else if (++gNvSens.failRun >= 5) {   // RM stopped answering this client: start over with a new one
++        SLOG("5 polls in a row failed: reopening the RM client");
++        nvSensDown(); gNvSens.failRun = 0; next = kNvSensRetryMs;
++    }
++    uint64_t when = 0;
++    clock_interval_to_deadline(next, kMillisecondScale, &when);
++    thread_call_enter_delayed(gNvSens.call, when);
++}
++static bool nvSensOff(void)
++{
++    int off = 0;
++    if (!gNvSens.off && PE_parse_boot_argn("-nvsensoff", &off, sizeof off)) gNvSens.off = true;
++    return gNvSens.off;
++}
++static void nvSensStart(void)
++{
++    if (nvSensOff()) { ALOG("sensors: off (-nvsensoff)"); return; }
++    if (gNvSens.call) return;
++    gNvSens.call = thread_call_allocate(&nvSensTick, nullptr);
++    if (!gNvSens.call) { ALOG("sensors: thread_call_allocate failed -- no GPU temperature or load"); return; }
++    uint64_t when = 0;
++    clock_interval_to_deadline(kNvSensRetryMs, kMillisecondScale, &when);
++    thread_call_enter_delayed(gNvSens.call, when);
++}
++
++// ---- PerformanceStatistics ----
++static void nvSensAdd(OSDictionary *d, const char *key, SInt32 v)
++{
++    if (v < 0) return;
++    if (OSNumber *n = OSNumber::withNumber((unsigned long long)v, 32)) { d->setObject(key, n); n->release(); }
++}
++static bool nvPerfSerialize(void *target, void *, OSSerialize *s)
++{
++    OSSerializer *orig = (OSSerializer *)target;
++    if (!gNvSensEnable) return orig->serialize(s);
++    OSDictionary *d = nullptr;
++    if (OSSerialize *tmp = OSSerialize::withCapacity(8192)) {
++        if (orig->serialize(tmp)) {
++            OSObject *o = OSUnserializeXML(tmp->text());
++            d = OSDynamicCast(OSDictionary, o);
++            if (!d && o) o->release();
++        }
++        tmp->release();
++    }
++    if (!d) return orig->serialize(s);
++    SInt32 gr = gNvSensGr;
++    nvSensAdd(d, "Device Utilization %", gr);
++    nvSensAdd(d, "GPU Activity(%)", gr);
++    nvSensAdd(d, "Renderer Utilization %", gr);
++    nvSensAdd(d, "Memory Controller Utilization %", gNvSensFb);
++    nvSensAdd(d, "Video Encode Utilization %", gNvSensEnc);
++    nvSensAdd(d, "Video Decode Utilization %", gNvSensDec);
++    nvSensAdd(d, "Temperature(C)", gNvSensTemp);
++    bool ok = d->serialize(s);
++    d->release();
++    return ok;
++}
++// setProperty hook: returns a wrapping serializer (caller releases) or nullptr to store the object unchanged
++static OSObject *nvPerfWrap(const char *key, OSObject *obj)
++{
++    if (nvSensOff() || !key || !obj || strcmp(key, "PerformanceStatistics")) return nullptr;
++    OSSerializer *orig = OSDynamicCast(OSSerializer, obj);
++    if (!orig) return nullptr;
++    orig->retain();   // the wrapper's target; kept for the accelerator's lifetime (the family sets it once)
++    OSSerializer *w = OSSerializer::forTarget(orig, &nvPerfSerialize, nullptr);
++    if (!w) { orig->release(); return nullptr; }
++    ALOG("sensors: PerformanceStatistics wrapped (%p around the family's %p)", w, orig);
++    return w;
++}
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 4e946ee..8740dc5 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -47,6 +47,7 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
+ #include "nvkms-kapi.h"
+ #include <sys/sysctl.h>
+ #include <libkern/OSAtomic.h>
++#include "nvaccel_sensors.h"
+ extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
+ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
+ int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
+@@ -612,6 +613,7 @@ public:
+               ALOG("user-client carriers: %u of %u ready (each holds ~1019 clients before "
+                    "IOService::attach starts sleeping)", n, (unsigned)NV_CARRIERS); }
+             enableFromHook("start");
++            nvSensStart();
+             fPCI = OSDynamicCast(IOPCIDevice, provider);
+             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
+             fRegLock = IOLockAlloc();
+@@ -652,6 +654,26 @@ public:
+         return r;
+     }
+     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
++    // PerformanceStatistics gains the GPU's temperature and load (nvaccel_sensors.h); every other property is stored as before
++    using IOGraphicsAccelerator2::setProperty;
++    bool setProperty(const char *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
++    bool setProperty(const OSSymbol *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key ? key->getCStringNoCopy() : nullptr, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
++    bool setProperty(const OSString *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key ? key->getCStringNoCopy() : nullptr, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
+     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
+@@ -940,7 +962,10 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+ 
+ static void nvAccelSurfScanoutSync(IOSurface *s);
+ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
++static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, unsigned wsw);
++static unsigned nvWswTarget(void);
++static void nvWswWait(unsigned target);
++static void nvWswNoteScanout(unsigned id);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+@@ -954,6 +979,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
+     OSObject  *ro = txn->getPlaneResource(0, 0);
+     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
++    if (s) nvWswNoteScanout((unsigned)s->getSurfaceID());
++    const unsigned wsw = nvWswTarget();
+ 
+     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+     NVResource *res = OSDynamicCast(NVResource, ro);
+@@ -971,6 +998,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
+     }
+     if (!s && vm && vm->fKva) {
++        nvWswWait(wsw);
+         const unsigned char *rr = (const unsigned char *)res;
+         w     = *(const volatile unsigned short *)(rr + 0xb0);
+         h     = *(const volatile unsigned short *)(rr + 0xb2);
+@@ -978,7 +1006,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
+         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
+         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
+-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
++    } else if (s && nvAccelIopFlip(fb, head, s, this, wsw)) {
+         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+         return kIOReturnSuccess;
+     } else if (s) {
+@@ -986,6 +1014,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
+         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
+         // Such a frame now keeps the previous picture on the panel instead.
++        nvWswWait(wsw);
+         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+         const unsigned fmt = s->getPixelFormat();
+         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+@@ -1128,6 +1157,137 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gI
+ NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
+ NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
+ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight (never expected)");
++// #196: WindowServer's frame fence. WindowServer swaps right after -commitAndWaitUntilSubmitted, and the swap has
++// to show finished pixels, so the plugin used to wait on the CPU for the whole frame to complete (~1.3 ms of a 6.9 ms
++// frame at 144 Hz, with no CPU/GPU overlap). Now the plugin tags each such command buffer with a sequence number
++// ("pending") before it commits and reports it "done" from its completion worker; the swap waits for every pending
++// number up to the newest one it saw before it reaches the panel -- on the async flip's thread call, so WindowServer
++// goes on to its next frame meanwhile. The ops ride NVRM's SURF_DIRTY escape with a magic in the plane field (NVRM
++// forwards the struct untouched); an older NVAccel rejects the probe (surface id 0) so the plugin keeps its CPU wait.
++#define NVRM_SS_KERNEL_ABI 1
++#include "../nvrm_surfshare_abi.h"
++#include <mach/mach_time.h>
++#define NVWSW_MAGIC 0x57530000u
++enum { NVWSW_PROBE = 1, NVWSW_PEND = 2, NVWSW_DONE = 3, NVWSW_SCANOUT = 4 };
++#define NVWSW_ACK   0x4e565731u
++static const unsigned kWswSlots = 32;
++static IOLock *gWswLock;
++static unsigned gWswSeq[kWswSlots];
++static uint64_t gWswT[kWswSlots];
++static volatile unsigned gWswLast;
++static int    gWsw = 1, gWswTimeoutMs = 100;
++static SInt64 gCntWswPend, gCntWswDone, gCntWswFull, gCntWswWaits, gCntWswWaitUs, gCntWswTimeout, gCntWswStale, gCntWswReject;
++// Surfaces put on a display (flipped or copied) in the last second. Only a WindowServer buffer that draws one of them may skip
++// the CPU wait: any other buffer (a window snapshot for the Dock, a screenshot) can be read by the CPU or another process
++// right after commitAndWaitUntilSubmitted, so its pixels must be complete when that call returns.
++static const unsigned kWswScanSlots = 16;
++static unsigned gWswScanId[kWswScanSlots];
++static uint64_t gWswScanT[kWswScanSlots];
++static SInt64 gCntWswScanYes, gCntWswScanNo;
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_wsw, CTLFLAG_RW | CTLFLAG_LOCKED, &gWsw, 0, "#196: 1 = WindowServer's swaps wait on the GPU in the kernel (plugin skips its CPU wait); 0 = refuse, the plugin waits on the CPU");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_wsw_timeout_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gWswTimeoutMs, 0, "#196: longest a swap waits for its frame's GPU work before it flips anyway");
++NVACCEL_CNT(nvaccel_wsw_pend,    gCntWswPend,    "#196: WindowServer frames tagged pending");
++NVACCEL_CNT(nvaccel_wsw_done,    gCntWswDone,    "#196: WindowServer frames reported done");
++NVACCEL_CNT(nvaccel_wsw_full,    gCntWswFull,    "#196: pending tags refused (table full / disabled) -- that frame used the CPU wait");
++NVACCEL_CNT(nvaccel_wsw_waits,   gCntWswWaits,   "#196: swaps that had to sleep for the GPU");
++NVACCEL_CNT(nvaccel_wsw_wait_us, gCntWswWaitUs,  "#196: total microseconds swaps slept for the GPU");
++NVACCEL_CNT(nvaccel_wsw_timeout, gCntWswTimeout, "#196: swaps that gave up waiting (nvaccel_wsw_timeout_ms)");
++NVACCEL_CNT(nvaccel_wsw_stale,   gCntWswStale,   "#196: pending tags older than 1 s dropped");
++NVACCEL_CNT(nvaccel_wsw_reject,  gCntWswReject,  "#196: ops from a process that is not WindowServer");
++NVACCEL_CNT(nvaccel_wsw_scan_yes, gCntWswScanYes, "#196: buffers drawing a displayed surface (may skip the CPU wait)");
++NVACCEL_CNT(nvaccel_wsw_scan_no,  gCntWswScanNo,  "#196: buffers drawing no displayed surface (snapshots, offscreen: CPU wait)");
++extern "C" void proc_selfname(char *buf, int size);
++static IOLock *nvWswLock(void)
++{
++    if (!gWswLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gWswLock)) IOLockFree(l); }
++    return gWswLock;
++}
++// Caller holds the lock. Drops tags older than a second (a WindowServer that died mid-frame).
++static bool nvWswOutstandingLocked(unsigned target)
++{
++    const uint64_t now = mach_absolute_time();
++    bool any = false;
++    for (unsigned i = 0; i < kWswSlots; i++) {
++        if (!gWswSeq[i]) continue;
++        if (now - gWswT[i] > 1000000000ull) { gWswSeq[i] = 0; OSAddAtomic64(1, &gCntWswStale); continue; }
++        if ((int)(gWswSeq[i] - target) <= 0) any = true;
++    }
++    return any;
++}
++static unsigned nvWswOp(unsigned op, unsigned seq)
++{
++    {
++        char nm[32]; nm[0] = 0; proc_selfname(nm, sizeof nm);
++        if (strncmp(nm, "WindowServer", sizeof nm)) { OSAddAtomic64(1, &gCntWswReject); return NVRM_SS_OFF; }
++    }
++    IOLock *lk = nvWswLock();
++    if (!lk) return NVRM_SS_OFF;
++    if (op == NVWSW_PROBE) return gWsw ? NVWSW_ACK : NVRM_SS_OFF;
++    if (!seq) return NVRM_SS_BAD_VERSION;
++    unsigned st = NVRM_SS_OFF;
++    IOLockLock(lk);
++    if (op == NVWSW_PEND) {
++        if (seq == 1) for (unsigned i = 0; i < kWswSlots; i++) gWswSeq[i] = 0;   // a new WindowServer
++        int k = -1;
++        if (gWsw) { (void)nvWswOutstandingLocked(seq); for (unsigned i = 0; i < kWswSlots; i++) if (!gWswSeq[i]) { k = (int)i; break; } }
++        if (k >= 0) { gWswSeq[k] = seq; gWswT[k] = mach_absolute_time(); gWswLast = seq; st = 0; OSAddAtomic64(1, &gCntWswPend); }
++        else OSAddAtomic64(1, &gCntWswFull);
++    } else if (op == NVWSW_DONE) {
++        for (unsigned i = 0; i < kWswSlots; i++) if (gWswSeq[i] == seq) { gWswSeq[i] = 0; st = 0; }
++        OSAddAtomic64(1, &gCntWswDone);
++        IOLockWakeup(lk, (event_t)gWswSeq, false);
++    } else if (op == NVWSW_SCANOUT) {   // seq = an IOSurface ID the buffer draws
++        const uint64_t now = mach_absolute_time();
++        for (unsigned i = 0; i < kWswScanSlots; i++)
++            if (gWswScanId[i] == seq && now - gWswScanT[i] < 1000000000ull) { st = gWsw ? NVWSW_ACK : NVRM_SS_OFF; break; }
++        OSAddAtomic64(1, st == NVWSW_ACK ? &gCntWswScanYes : &gCntWswScanNo);
++    }
++    IOLockUnlock(lk);
++    return st;
++}
++// performTransaction: this surface is on a display now (flip or copy)
++static void nvWswNoteScanout(unsigned id)
++{
++    IOLock *lk = nvWswLock();
++    if (!lk || !id) return;
++    const uint64_t now = mach_absolute_time();
++    IOLockLock(lk);
++    unsigned k = 0;
++    for (unsigned i = 0; i < kWswScanSlots; i++) {
++        if (gWswScanId[i] == id) { k = i; break; }
++        if (gWswScanT[i] < gWswScanT[k]) k = i;   // else the oldest slot
++    }
++    gWswScanId[k] = id; gWswScanT[k] = now;
++    IOLockUnlock(lk);
++}
++// The newest pending number when a swap arrives: its own frame's (the plugin tags before it commits).
++static unsigned nvWswTarget(void)
++{
++    if (!gWswLock) return 0;
++    IOLockLock(gWswLock);
++    const unsigned t = nvWswOutstandingLocked(gWswLast) ? gWswLast : 0;
++    IOLockUnlock(gWswLock);
++    return t;
++}
++static void nvWswWait(unsigned target)
++{
++    if (!target || !gWswLock) return;
++    const uint64_t t0 = mach_absolute_time();
++    bool slept = false;
++    IOLockLock(gWswLock);
++    while (nvWswOutstandingLocked(target)) {
++        uint64_t deadline; clock_interval_to_deadline((uint32_t)(gWswTimeoutMs > 0 ? gWswTimeoutMs : 1), kMillisecondScale, &deadline);
++        slept = true;
++        if (IOLockSleepDeadline(gWswLock, (event_t)gWswSeq, *(AbsoluteTime *)&deadline, THREAD_UNINT) == THREAD_TIMED_OUT
++            && nvWswOutstandingLocked(target)) {
++            for (unsigned i = 0; i < kWswSlots; i++) if (gWswSeq[i] && (int)(gWswSeq[i] - target) <= 0) gWswSeq[i] = 0;
++            OSAddAtomic64(1, &gCntWswTimeout);
++            break;
++        }
++    }
++    IOLockUnlock(gWswLock);
++    if (slept) { OSAddAtomic64(1, &gCntWswWaits); OSAddAtomic64((SInt64)((mach_absolute_time() - t0) / 1000), &gCntWswWaitUs); }
++}
+ static int gCrcHead = 0;
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
+ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
+@@ -1143,6 +1303,8 @@ static void nvaccelInstallSysctl(void)
+     gSysctlInstalled = true;
+ #else
+     sysctl_register_oid(&sysctl__debug_nvaccelfb);
++    sysctl_register_oid(&sysctl__debug_nvaccel_sensors);
++    sysctl_register_oid(&sysctl__debug_nvaccel_gpu_temp);  sysctl_register_oid(&sysctl__debug_nvaccel_gpu_util);
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
+@@ -1171,6 +1333,12 @@ static void nvaccelInstallSysctl(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw);            sysctl_register_oid(&sysctl__debug_nvaccel_wsw_timeout_ms);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_pend);       sysctl_register_oid(&sysctl__debug_nvaccel_wsw_done);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_full);       sysctl_register_oid(&sysctl__debug_nvaccel_wsw_waits);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_wait_us);    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_timeout);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_stale);      sysctl_register_oid(&sysctl__debug_nvaccel_wsw_reject);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_scan_yes);   sysctl_register_oid(&sysctl__debug_nvaccel_wsw_scan_no);
+     gSysctlInstalled = true;
+     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
+ #endif
+@@ -1335,6 +1503,7 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
+ }
+ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
+ {
++    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & 0xffff0000u) == NVWSW_MAGIC) { p->status = nvWswOp(p->plane & 0xffffu, p->surfaceID); return kIOReturnSuccess; }
+     p->hSrcClient = p->hSrcMemory = 0;
+     if (p->version != NVRM_SURFSHARE_VERSION) { p->status = NVRM_SS_BAD_VERSION; return kIOReturnSuccess; }
+     NVAccel *a = NVAccel::gAccel;
+@@ -1558,7 +1727,7 @@ void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *ar
+ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
+ int thread_call_enter(struct thread_call *call);
+ }
+-struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; };
++struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; unsigned wsw; };
+ static NVIopAsync gIopAs[kNvMaxFB];
+ static SInt32 gIopAsyncRefuseRun;
+ static bool nvAccelIopAsyncBusy(const void *pipe)
+@@ -1572,6 +1741,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
+     NVIopAsync *e = (NVIopAsync *)p0;
+     const unsigned head = (unsigned)(e - gIopAs);
+     IOSurface *s = e->s; e->s = nullptr;
++    nvWswWait(e->wsw); e->wsw = 0;
+     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+     if (sym) sym->release();
+@@ -1596,7 +1766,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
+     __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
+     _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
+ }
+-static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f)
++static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f, unsigned wsw)
+ {
+     NVIopAsync *e = &gIopAs[head];
+     for (unsigned i = 0; i < 50 && __atomic_load_n(&e->busy, __ATOMIC_ACQUIRE); i++) IOSleep(1);
+@@ -1607,13 +1777,13 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
+     if (!e->call) e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
+     if (!e->call) return false;
+     ((OSObject *)s)->retain();
+-    e->pipe = pipe; e->fb = fb; e->s = s;
++    e->pipe = pipe; e->fb = fb; e->s = s; e->wsw = wsw;
+     for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->f)[i] = ((const unsigned char *)f)[i];
+     __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
+     thread_call_enter(e->call);
+     return true;
+ }
+-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
++static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, unsigned wsw)
+ {
+     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
+     // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
+@@ -1638,14 +1808,17 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
+         if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
+     }
+     volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+-    const bool vramNewest = valid && (valid[6] & 1u);
++    bool vramNewest = valid && (valid[6] & 1u);
++    // a surface's first frame is only marked VRAM-newest once its GPU work completes
++    if (!vramNewest && wsw && valid) { nvWswWait(wsw); wsw = 0; vramNewest = (valid[6] & 1u) != 0; }
+     if (!kmem) return nvAccelIopFlipNo(4);
+     if (!vramNewest) return nvAccelIopFlipNo(5);
+     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
+     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
+     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
+-    if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
++    if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f, wsw);
++    nvWswWait(wsw);
+     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+     if (sym) sym->release();

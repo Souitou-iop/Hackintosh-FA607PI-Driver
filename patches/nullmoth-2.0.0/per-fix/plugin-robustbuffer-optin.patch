@@ -1,0 +1,35 @@
+From 64159770e15679e97d70e1073b303cf247b5fae0 Mon Sep 17 00:00:00 2001
+From: Souitou-iop <Souitou-iop@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:34:46 +0800
+Subject: [PATCH] robustBufferAccess opt-in (NVMTL_ROBUST_BUFFERS=1): with it
+ NVK clamps texture-array indexing to count-1 bindings (sarray FAIL, fix 25
+ undone)
+
+---
+ plugin/nvmtl_vk.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index d8caac7..4178264 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -1018,8 +1018,14 @@ static int nvmtl_vk_initialize(void)
+     // Metal apps read past buffer ends and Apple GPUs tolerate it; on NVK an unchecked load off the end of a
+     // mapping is an MMU FAULT_PTE that kills the channel (WoW at the login screen). Bounds-checked buffer and
+     // vertex-fetch access turns those reads into zeros instead.
+-    enabled.robustBufferAccess = supported.robustBufferAccess;
+-    nvlog("vk: robustBufferAccess %s", supported.robustBufferAccess ? "ON (out-of-range buffer reads return zeros)" : "ABSENT - out-of-range buffer reads can fault the channel");
++    // LOCAL: off unless NVMTL_ROBUST_BUFFERS=1 (nvrm610.conf). With it on, NVK also clamps descriptor-array indexing to each
++    // binding's own count, and a Metal texture/sampler array is laid out by the translator as consecutive count-1 bindings
++    // (friend fix 25), so every element read element 0: catest sarray FAIL, xterm.js/ANGLE glyph atlases (Claude terminal
++    // text) blank again. 1.15 ran without it.
++    { const char *rb = getenv("NVMTL_ROBUST_BUFFERS"); const int want = rb && rb[0] == '1';
++      enabled.robustBufferAccess = want ? supported.robustBufferAccess : VK_FALSE;
++      nvlog("vk: robustBufferAccess %s", !want ? "OFF (NVMTL_ROBUST_BUFFERS=1 turns it on; texture arrays then read element 0)"
++            : supported.robustBufferAccess ? "ON (out-of-range buffer reads return zeros)" : "ABSENT - out-of-range buffer reads can fault the channel"); }
+     g_sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
+     nvlog("vk: sampler anisotropy %d (max %g), mirror-clamp-to-edge %d", g_sampler_anisotropy,
+           (double)g_lim.maxSamplerAnisotropy, g_sampler_mirror_clamp);
+-- 
+2.50.1 (Apple Git-155)
+

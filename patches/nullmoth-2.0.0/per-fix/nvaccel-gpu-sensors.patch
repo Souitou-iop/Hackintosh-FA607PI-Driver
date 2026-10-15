@@ -1,0 +1,338 @@
+From 272cc2a2d4e07b98c24789bdead896e59389b3b8 Mon Sep 17 00:00:00 2001
+From: Souitou-iop <Souitou-iop@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:51:39 +0800
+Subject: [PATCH] GPU sensors
+
+---
+ accel/nvaccel_sensors.h | 262 ++++++++++++++++++++++++++++++++++++++++
+ accel/nvrm-accel.cpp    |  24 ++++
+ 2 files changed, 286 insertions(+)
+ create mode 100644 accel/nvaccel_sensors.h
+
+diff --git a/accel/nvaccel_sensors.h b/accel/nvaccel_sensors.h
+new file mode 100644
+index 0000000..7057f4f
+--- /dev/null
++++ b/accel/nvaccel_sensors.h
+@@ -0,0 +1,262 @@
++// GPU sensors for system monitors (Stats, iStat Menus, ...): they read the accelerator's "PerformanceStatistics"
++// dictionary and look for "Device Utilization %" and "Temperature(C)", which only a vendor driver fills in.
++//
++// The family publishes PerformanceStatistics as an OSSerializer that builds the dictionary each time it is read.
++// NVAccel's setProperty wraps that serializer: the family's dictionary is built as before, the GPU keys are added,
++// and the result is serialized. The values come from a kernel thread that asks RM once a second, through NVRM's own
++// RM client bridge (the one NVAccel already creates for Metal clients) - the same escapes nvidia-smi's library uses:
++//   temperature  NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2 (sensor reading)
++//   load         NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2 (graphics, memory, NVENC, NVDEC; 200 ms samples)
++// RM copies control parameters with copyin/copyout; on a kernel thread (pmap == kernel_pmap) XNU's copyio reads and
++// writes kernel addresses, so plain kernel buffers work as the "user" side.
++// Boot-arg -nvsensoff: no RM client, no polling, and PerformanceStatistics stays the family's own serializer.
++#pragma once
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <kern/thread_call.h>
++#include "nvos.h"
++#include "nv_escape.h"
++#include "nv-ioctl.h"
++#include "class/cl0000.h"
++#include "class/cl0080.h"
++#include "class/cl2080.h"
++#include "ctrl/ctrl0000/ctrl0000gpu.h"
++#include "ctrl/ctrl2080/ctrl2080thermal.h"
++#include "ctrl/ctrl2080/ctrl2080perf.h"
++#include "ctrl/ctrl2080/ctrl2080gpumon.h"
++
++static constexpr uint32_t kNvSensPeriodMs = 1000, kNvSensRetryMs = 5000;
++static constexpr NvHandle kNvSensDevice = 0xcafe5e01, kNvSensSub = 0xcafe5e02;
++static constexpr int kNvSensAvg = 5;   // samples averaged: 5 x 200 ms = the last second
++
++static volatile SInt32 gNvSensTemp = -1, gNvSensGr = -1, gNvSensFb = -1, gNvSensEnc = -1, gNvSensDec = -1;
++static int gNvSensEnable = 1;   // sysctl debug.nvaccel_sensors: 0 stops asking RM and leaves PerformanceStatistics as the family's
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_sensors, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvSensEnable, 0,
++           "1 = GPU temperature and load in PerformanceStatistics (polled from RM every second); 0 = off");
++// CTLFLAG_KERN: other kexts (AsusFanSMC's TG0D) read these with sysctlbyname, which the kernel refuses without it
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_gpu_temp, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (int *)&gNvSensTemp, 0, "GPU temperature, C (-1 = unknown)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_gpu_util, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (int *)&gNvSensGr, 0, "GPU graphics engine load, % (-1 = unknown)");
++static struct {
++    thread_call_t call;
++    IOUserClient *uc;
++    NvHandle      hClient;
++    bool          up, off;
++    unsigned      failRun, logged;
++    NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS               *tp;
++    NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS *util;
++} gNvSens;
++
++#define SLOG(fmt, ...) do { if (gNvSens.logged < 24) { gNvSens.logged++; ALOG("sensors: " fmt, ##__VA_ARGS__); } } while (0)
++
++static IOReturn nvSensEsc(uint32_t cmd, void *p, uint32_t size)
++{
++    uint64_t in = cmd;
++    IOExternalMethodArguments a;
++    bzero(&a, sizeof a);
++    a.version = kIOExternalMethodArgumentsCurrentVersion;
++    a.selector = 1;   // NVRMUserClient sEsc
++    a.scalarInput = &in; a.scalarInputCount = 1;
++    a.structureInput = p; a.structureInputSize = size;
++    a.structureOutput = p; a.structureOutputSize = size;
++    return gNvSens.uc->externalMethod(1, &a, nullptr, nullptr, nullptr);
++}
++static NvU32 nvSensCtrl(NvHandle obj, NvU32 cmd, void *params, NvU32 size)
++{
++    NVOS54_PARAMETERS p;
++    bzero(&p, sizeof p);
++    p.hClient = gNvSens.hClient; p.hObject = obj; p.cmd = cmd; p.params = (NvP64)(uintptr_t)params; p.paramsSize = size;
++    if (nvSensEsc(NV_ESC_RM_CONTROL, &p, sizeof p) != kIOReturnSuccess) return p.status ? p.status : NV_ERR_GENERIC;
++    return p.status;
++}
++static NvU32 nvSensAlloc(NvHandle parent, NvHandle obj, NvU32 cls, void *params, NvU32 size)
++{
++    NVOS21_PARAMETERS p;
++    bzero(&p, sizeof p);
++    p.hRoot = gNvSens.hClient; p.hObjectParent = parent; p.hObjectNew = obj; p.hClass = cls;
++    p.pAllocParms = (NvP64)(uintptr_t)params; p.paramsSize = size;
++    if (nvSensEsc(NV_ESC_RM_ALLOC, &p, sizeof p) != kIOReturnSuccess) return p.status ? p.status : NV_ERR_GENERIC;
++    return p.status;
++}
++static void nvSensDown(void)
++{
++    if (gNvSens.uc) {
++        if (gNvSens.hClient) {
++            NVOS00_PARAMETERS p;
++            bzero(&p, sizeof p);
++            p.hRoot = gNvSens.hClient; p.hObjectParent = gNvSens.hClient; p.hObjectOld = gNvSens.hClient;
++            nvSensEsc(NV_ESC_RM_FREE, &p, sizeof p);
++        }
++        gNvSens.uc->clientClose();
++        gNvSens.uc->release();
++    }
++    gNvSens.uc = nullptr; gNvSens.hClient = 0; gNvSens.up = false;
++    gNvSensTemp = gNvSensGr = gNvSensFb = gNvSensEnc = gNvSensDec = -1;
++}
++static bool nvSensUp(void)
++{
++    if (!gNvSens.tp)   gNvSens.tp   = (decltype(gNvSens.tp))IOMalloc(sizeof *gNvSens.tp);       // kept for the boot
++    if (!gNvSens.util) gNvSens.util = (decltype(gNvSens.util))IOMalloc(sizeof *gNvSens.util);
++    if (!gNvSens.tp || !gNvSens.util) { SLOG("no memory for the RM parameters"); return false; }
++    OSDictionary *m = IOService::serviceMatching("NVRM");
++    IOService *nvrm = m ? IOService::copyMatchingService(m) : nullptr;
++    if (m) m->release();
++    if (!nvrm) { SLOG("no NVRM service yet"); return false; }
++    const OSSymbol *fn = OSSymbol::withCStringNoCopy("nvNewAccelClient");
++    IOUserClient *uc = nullptr;
++    IOReturn r = fn ? nvrm->callPlatformFunction(fn, false, (void *)kernel_task, (void *)0 /* ctl */, &uc, nullptr) : kIOReturnNoMemory;
++    if (fn) fn->release();
++    nvrm->release();
++    if (r != kIOReturnSuccess || !uc) { SLOG("NVRM gave no RM client (0x%x)", r); return false; }
++    gNvSens.uc = uc;
++
++    NvU32 st;
++    { NVOS21_PARAMETERS p; bzero(&p, sizeof p); p.hClass = NV01_ROOT_CLIENT;
++      if (nvSensEsc(NV_ESC_RM_ALLOC, &p, sizeof p) != kIOReturnSuccess || p.status) {
++          SLOG("RM client alloc failed (status 0x%x)", p.status); nvSensDown(); return false; }
++      gNvSens.hClient = p.hObjectNew; }
++    nv_ioctl_card_info_t ci[4];
++    bzero(ci, sizeof ci);
++    if (nvSensEsc(NV_ESC_CARD_INFO, ci, sizeof ci) != kIOReturnSuccess || !ci[0].valid) { SLOG("card info failed"); nvSensDown(); return false; }
++    NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS id;
++    bzero(&id, sizeof id); id.gpuId = ci[0].gpu_id;
++    if ((st = nvSensCtrl(gNvSens.hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &id, sizeof id))) { SLOG("GET_ID_INFO_V2 0x%x", st); nvSensDown(); return false; }
++    NV0080_ALLOC_PARAMETERS a80;
++    bzero(&a80, sizeof a80); a80.deviceId = id.deviceInstance; a80.hClientShare = gNvSens.hClient;
++    if ((st = nvSensAlloc(gNvSens.hClient, kNvSensDevice, NV01_DEVICE_0, &a80, sizeof a80))) { SLOG("device alloc 0x%x", st); nvSensDown(); return false; }
++    NV2080_ALLOC_PARAMETERS a20;
++    bzero(&a20, sizeof a20); a20.subDeviceId = id.subDeviceInstance;
++    if ((st = nvSensAlloc(kNvSensDevice, kNvSensSub, NV20_SUBDEVICE_0, &a20, sizeof a20))) { SLOG("subdevice alloc 0x%x", st); nvSensDown(); return false; }
++    gNvSens.up = true;
++    SLOG("RM client 0x%x on GPU 0x%x: polling temperature and load every %u ms", gNvSens.hClient, ci[0].gpu_id, kNvSensPeriodMs);
++    return true;
++}
++static bool nvSensPoll(void)
++{
++    NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS *tp = gNvSens.tp;
++    bzero(tp, sizeof *tp);
++    tp->clientAPIVersion = THERMAL_SYSTEM_API_VER; tp->clientAPIRevision = THERMAL_SYSTEM_API_REV;
++    tp->clientInstructionSizeOf = sizeof(NV2080_CTRL_THERMAL_SYSTEM_INSTRUCTION);
++    tp->executeFlags = NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_FLAGS_IGNORE_FAIL;
++    tp->instructionListSize = 1;
++    tp->instructionList[0].opcode = NV2080_CTRL_THERMAL_SYSTEM_GET_STATUS_SENSOR_READING_OPCODE;
++    tp->instructionList[0].operands.getStatusSensorReading.sensorIndex = 0;   // sensor 0 = the GPU core
++    NvU32 st = nvSensCtrl(kNvSensSub, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, tp, sizeof *tp);
++    bool okT = !st && tp->instructionList[0].executed && !tp->instructionList[0].result;
++    NvS32 t = tp->instructionList[0].operands.getStatusSensorReading.value;
++    gNvSensTemp = (okT && t > 0 && t < 150) ? t : -1;
++    if (!okT) SLOG("temperature: status 0x%x result 0x%x", st, tp->instructionList[0].result);
++
++    NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS *u = gNvSens.util;
++    bzero(u, sizeof *u);
++    u->type = NV2080_CTRL_GPUMON_SAMPLE_TYPE_PERFMON_UTIL;
++    u->bufSize = sizeof u->samples;
++    st = nvSensCtrl(kNvSensSub, NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2, u, sizeof *u);
++    bool okU = !st;
++    if (okU) {
++        // the ring's order is RM's business: take the newest samples by timestamp
++        const int n = NV2080_CTRL_PERF_GPUMON_SAMPLE_COUNT_PERFMON_UTIL;
++        int idx[kNvSensAvg]; int got = 0;
++        for (int k = 0; k < kNvSensAvg; k++) {
++            int best = -1;
++            for (int i = 0; i < n; i++) {
++                NvU64 ts = u->samples[i].base.timeStamp;
++                if (!ts) continue;
++                bool used = false;
++                for (int j = 0; j < got; j++) if (idx[j] == i) used = true;
++                if (!used && (best < 0 || ts > u->samples[best].base.timeStamp)) best = i;
++            }
++            if (best < 0) break;
++            idx[got++] = best;
++        }
++        if (got) {
++            uint64_t gr = 0, fb = 0, enc = 0, dec = 0;
++            for (int j = 0; j < got; j++) {
++                gr += u->samples[idx[j]].gr.util; fb += u->samples[idx[j]].fb.util;
++                enc += u->samples[idx[j]].nvenc.util; dec += u->samples[idx[j]].nvdec.util;
++            }
++            // RM reports pct*100
++            gNvSensGr  = (SInt32)((gr  / (unsigned)got + 50) / 100); gNvSensFb  = (SInt32)((fb  / (unsigned)got + 50) / 100);
++            gNvSensEnc = (SInt32)((enc / (unsigned)got + 50) / 100); gNvSensDec = (SInt32)((dec / (unsigned)got + 50) / 100);
++        } else okU = false;
++    } else SLOG("load samples: status 0x%x", st);
++    if (!okU) gNvSensGr = gNvSensFb = gNvSensEnc = gNvSensDec = -1;
++    return okT || okU;
++}
++static void nvSensTick(void *, void *)
++{
++    uint32_t next = kNvSensPeriodMs;
++    if (!gNvSensEnable) {
++        if (gNvSens.up) { SLOG("debug.nvaccel_sensors=0: RM client closed"); nvSensDown(); }
++        next = kNvSensRetryMs;
++    } else if (!gNvSens.up && !nvSensUp()) next = kNvSensRetryMs;
++    else if (nvSensPoll()) gNvSens.failRun = 0;
++    else if (++gNvSens.failRun >= 5) {   // RM stopped answering this client: start over with a new one
++        SLOG("5 polls in a row failed: reopening the RM client");
++        nvSensDown(); gNvSens.failRun = 0; next = kNvSensRetryMs;
++    }
++    uint64_t when = 0;
++    clock_interval_to_deadline(next, kMillisecondScale, &when);
++    thread_call_enter_delayed(gNvSens.call, when);
++}
++static bool nvSensOff(void)
++{
++    int off = 0;
++    if (!gNvSens.off && PE_parse_boot_argn("-nvsensoff", &off, sizeof off)) gNvSens.off = true;
++    return gNvSens.off;
++}
++static void nvSensStart(void)
++{
++    if (nvSensOff()) { ALOG("sensors: off (-nvsensoff)"); return; }
++    if (gNvSens.call) return;
++    gNvSens.call = thread_call_allocate(&nvSensTick, nullptr);
++    if (!gNvSens.call) { ALOG("sensors: thread_call_allocate failed -- no GPU temperature or load"); return; }
++    uint64_t when = 0;
++    clock_interval_to_deadline(kNvSensRetryMs, kMillisecondScale, &when);
++    thread_call_enter_delayed(gNvSens.call, when);
++}
++
++// ---- PerformanceStatistics ----
++static void nvSensAdd(OSDictionary *d, const char *key, SInt32 v)
++{
++    if (v < 0) return;
++    if (OSNumber *n = OSNumber::withNumber((unsigned long long)v, 32)) { d->setObject(key, n); n->release(); }
++}
++static bool nvPerfSerialize(void *target, void *, OSSerialize *s)
++{
++    OSSerializer *orig = (OSSerializer *)target;
++    if (!gNvSensEnable) return orig->serialize(s);
++    OSDictionary *d = nullptr;
++    if (OSSerialize *tmp = OSSerialize::withCapacity(8192)) {
++        if (orig->serialize(tmp)) {
++            OSObject *o = OSUnserializeXML(tmp->text());
++            d = OSDynamicCast(OSDictionary, o);
++            if (!d && o) o->release();
++        }
++        tmp->release();
++    }
++    if (!d) return orig->serialize(s);
++    SInt32 gr = gNvSensGr;
++    nvSensAdd(d, "Device Utilization %", gr);
++    nvSensAdd(d, "GPU Activity(%)", gr);
++    nvSensAdd(d, "Renderer Utilization %", gr);
++    nvSensAdd(d, "Memory Controller Utilization %", gNvSensFb);
++    nvSensAdd(d, "Video Encode Utilization %", gNvSensEnc);
++    nvSensAdd(d, "Video Decode Utilization %", gNvSensDec);
++    nvSensAdd(d, "Temperature(C)", gNvSensTemp);
++    bool ok = d->serialize(s);
++    d->release();
++    return ok;
++}
++// setProperty hook: returns a wrapping serializer (caller releases) or nullptr to store the object unchanged
++static OSObject *nvPerfWrap(const char *key, OSObject *obj)
++{
++    if (nvSensOff() || !key || !obj || strcmp(key, "PerformanceStatistics")) return nullptr;
++    OSSerializer *orig = OSDynamicCast(OSSerializer, obj);
++    if (!orig) return nullptr;
++    orig->retain();   // the wrapper's target; kept for the accelerator's lifetime (the family sets it once)
++    OSSerializer *w = OSSerializer::forTarget(orig, &nvPerfSerialize, nullptr);
++    if (!w) { orig->release(); return nullptr; }
++    ALOG("sensors: PerformanceStatistics wrapped (%p around the family's %p)", w, orig);
++    return w;
++}
+diff --git a/accel/nvrm-accel.cpp b/accel/nvrm-accel.cpp
+index 4e946ee..49347aa 100644
+--- a/accel/nvrm-accel.cpp
++++ b/accel/nvrm-accel.cpp
+@@ -47,6 +47,7 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
+ #include "nvkms-kapi.h"
+ #include <sys/sysctl.h>
+ #include <libkern/OSAtomic.h>
++#include "nvaccel_sensors.h"
+ extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
+ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
+ int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
+@@ -612,6 +613,7 @@ public:
+               ALOG("user-client carriers: %u of %u ready (each holds ~1019 clients before "
+                    "IOService::attach starts sleeping)", n, (unsigned)NV_CARRIERS); }
+             enableFromHook("start");
++            nvSensStart();
+             fPCI = OSDynamicCast(IOPCIDevice, provider);
+             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
+             fRegLock = IOLockAlloc();
+@@ -652,6 +654,26 @@ public:
+         return r;
+     }
+     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
++    // PerformanceStatistics gains the GPU's temperature and load (nvaccel_sensors.h); every other property is stored as before
++    using IOGraphicsAccelerator2::setProperty;
++    bool setProperty(const char *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
++    bool setProperty(const OSSymbol *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key ? key->getCStringNoCopy() : nullptr, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
++    bool setProperty(const OSString *key, OSObject *obj) APPLE_KEXT_OVERRIDE {
++        OSObject *w = nvPerfWrap(key ? key->getCStringNoCopy() : nullptr, obj);
++        bool r = IOGraphicsAccelerator2::setProperty(key, w ? w : obj);
++        if (w) w->release();
++        return r;
++    }
+     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
+@@ -1143,6 +1165,8 @@ static void nvaccelInstallSysctl(void)
+     gSysctlInstalled = true;
+ #else
+     sysctl_register_oid(&sysctl__debug_nvaccelfb);
++    sysctl_register_oid(&sysctl__debug_nvaccel_sensors);
++    sysctl_register_oid(&sysctl__debug_nvaccel_gpu_temp);  sysctl_register_oid(&sysctl__debug_nvaccel_gpu_util);
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
+-- 
+2.50.1 (Apple Git-155)
+

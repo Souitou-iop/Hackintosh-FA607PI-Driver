@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>DisplayProductID</key>
+	<integer>3200</integer>
+	<key>DisplayProductName</key>
+	<string>NE160QDM-NYJ (HiDPI)</string>
+	<key>DisplayVendorID</key>
+	<integer>2533</integer>
+	<key>scale-resolutions</key>
+	<array>
+		<data>
+		AAANIAAACDQAAAAB
+		</data>
+		<data>
+		AAAMgAAAB9AAAAAB
+		</data>
+		<data>
+		AAALQAAABwgAAAAB
+		</data>
+		<data>
+		AAAKAAAABkAAAAAB
+		</data>
+		<data>
+		AAAKAAAABkA=
+		</data>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,106 @@
+From 9cc1d61c49a8fee3460f778fbde52fd14377d663 Mon Sep 17 00:00:00 2001
+From: Souitou-iop <Souitou-iop@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 13:18:26 +0800
+Subject: [PATCH] NVAccel #196: only buffers that draw a displayed surface skip
+ the CPU wait (SCANOUT op); snapshots wait again (Dock minimized previews were
+ blank)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/nvrm-accel.cpp | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/accel/nvrm-accel.cpp b/accel/nvrm-accel.cpp
+index aabc588..8740dc5 100644
+--- a/accel/nvrm-accel.cpp
++++ b/accel/nvrm-accel.cpp
+@@ -965,6 +965,7 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, unsigned wsw);
+ static unsigned nvWswTarget(void);
+ static void nvWswWait(unsigned target);
++static void nvWswNoteScanout(unsigned id);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+@@ -978,6 +979,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
+     OSObject  *ro = txn->getPlaneResource(0, 0);
+     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
++    if (s) nvWswNoteScanout((unsigned)s->getSurfaceID());
+     const unsigned wsw = nvWswTarget();
+ 
+     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+@@ -1166,7 +1168,7 @@ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped beca
+ #include "../nvrm_surfshare_abi.h"
+ #include <mach/mach_time.h>
+ #define NVWSW_MAGIC 0x57530000u
+-enum { NVWSW_PROBE = 1, NVWSW_PEND = 2, NVWSW_DONE = 3 };
++enum { NVWSW_PROBE = 1, NVWSW_PEND = 2, NVWSW_DONE = 3, NVWSW_SCANOUT = 4 };
+ #define NVWSW_ACK   0x4e565731u
+ static const unsigned kWswSlots = 32;
+ static IOLock *gWswLock;
+@@ -1175,6 +1177,13 @@ static uint64_t gWswT[kWswSlots];
+ static volatile unsigned gWswLast;
+ static int    gWsw = 1, gWswTimeoutMs = 100;
+ static SInt64 gCntWswPend, gCntWswDone, gCntWswFull, gCntWswWaits, gCntWswWaitUs, gCntWswTimeout, gCntWswStale, gCntWswReject;
++// Surfaces put on a display (flipped or copied) in the last second. Only a WindowServer buffer that draws one of them may skip
++// the CPU wait: any other buffer (a window snapshot for the Dock, a screenshot) can be read by the CPU or another process
++// right after commitAndWaitUntilSubmitted, so its pixels must be complete when that call returns.
++static const unsigned kWswScanSlots = 16;
++static unsigned gWswScanId[kWswScanSlots];
++static uint64_t gWswScanT[kWswScanSlots];
++static SInt64 gCntWswScanYes, gCntWswScanNo;
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_wsw, CTLFLAG_RW | CTLFLAG_LOCKED, &gWsw, 0, "#196: 1 = WindowServer's swaps wait on the GPU in the kernel (plugin skips its CPU wait); 0 = refuse, the plugin waits on the CPU");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_wsw_timeout_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gWswTimeoutMs, 0, "#196: longest a swap waits for its frame's GPU work before it flips anyway");
+ NVACCEL_CNT(nvaccel_wsw_pend,    gCntWswPend,    "#196: WindowServer frames tagged pending");
+@@ -1185,6 +1194,8 @@ NVACCEL_CNT(nvaccel_wsw_wait_us, gCntWswWaitUs,  "#196: total microseconds swaps
+ NVACCEL_CNT(nvaccel_wsw_timeout, gCntWswTimeout, "#196: swaps that gave up waiting (nvaccel_wsw_timeout_ms)");
+ NVACCEL_CNT(nvaccel_wsw_stale,   gCntWswStale,   "#196: pending tags older than 1 s dropped");
+ NVACCEL_CNT(nvaccel_wsw_reject,  gCntWswReject,  "#196: ops from a process that is not WindowServer");
++NVACCEL_CNT(nvaccel_wsw_scan_yes, gCntWswScanYes, "#196: buffers drawing a displayed surface (may skip the CPU wait)");
++NVACCEL_CNT(nvaccel_wsw_scan_no,  gCntWswScanNo,  "#196: buffers drawing no displayed surface (snapshots, offscreen: CPU wait)");
+ extern "C" void proc_selfname(char *buf, int size);
+ static IOLock *nvWswLock(void)
+ {
+@@ -1225,10 +1236,30 @@ static unsigned nvWswOp(unsigned op, unsigned seq)
+         for (unsigned i = 0; i < kWswSlots; i++) if (gWswSeq[i] == seq) { gWswSeq[i] = 0; st = 0; }
+         OSAddAtomic64(1, &gCntWswDone);
+         IOLockWakeup(lk, (event_t)gWswSeq, false);
++    } else if (op == NVWSW_SCANOUT) {   // seq = an IOSurface ID the buffer draws
++        const uint64_t now = mach_absolute_time();
++        for (unsigned i = 0; i < kWswScanSlots; i++)
++            if (gWswScanId[i] == seq && now - gWswScanT[i] < 1000000000ull) { st = gWsw ? NVWSW_ACK : NVRM_SS_OFF; break; }
++        OSAddAtomic64(1, st == NVWSW_ACK ? &gCntWswScanYes : &gCntWswScanNo);
+     }
+     IOLockUnlock(lk);
+     return st;
+ }
++// performTransaction: this surface is on a display now (flip or copy)
++static void nvWswNoteScanout(unsigned id)
++{
++    IOLock *lk = nvWswLock();
++    if (!lk || !id) return;
++    const uint64_t now = mach_absolute_time();
++    IOLockLock(lk);
++    unsigned k = 0;
++    for (unsigned i = 0; i < kWswScanSlots; i++) {
++        if (gWswScanId[i] == id) { k = i; break; }
++        if (gWswScanT[i] < gWswScanT[k]) k = i;   // else the oldest slot
++    }
++    gWswScanId[k] = id; gWswScanT[k] = now;
++    IOLockUnlock(lk);
++}
+ // The newest pending number when a swap arrives: its own frame's (the plugin tags before it commits).
+ static unsigned nvWswTarget(void)
+ {
+@@ -1307,6 +1338,7 @@ static void nvaccelInstallSysctl(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_wsw_full);       sysctl_register_oid(&sysctl__debug_nvaccel_wsw_waits);
+     sysctl_register_oid(&sysctl__debug_nvaccel_wsw_wait_us);    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_timeout);
+     sysctl_register_oid(&sysctl__debug_nvaccel_wsw_stale);      sysctl_register_oid(&sysctl__debug_nvaccel_wsw_reject);
++    sysctl_register_oid(&sysctl__debug_nvaccel_wsw_scan_yes);   sysctl_register_oid(&sysctl__debug_nvaccel_wsw_scan_no);
+     gSysctlInstalled = true;
+     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,48 @@
+From 4524ace98c36d58e5c061995268922fb6b2f61d1 Mon Sep 17 00:00:00 2001
+From: Souitou-iop <Souitou-iop@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 13:20:33 +0800
+Subject: [PATCH] #196: only buffers that draw a displayed surface (NVAccel
+ SCANOUT op) skip the CPU wait; snapshots wait again (Dock minimized previews
+ were blank)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLObjects.m | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 4d2f3b4..800556e 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -5245,10 +5245,27 @@ - (void)nvmtlWaitSubmitted {
+     while (!_wasScheduled && !_executionDone) [_completionCondition wait];
+     [_completionCondition unlock];
+ }
++// #196: only a buffer that draws a surface the display is showing (NVAccel's SCANOUT op: flipped or copied to a head in the
++// last second) may return before its GPU work completes; the swap that follows waits for it in the kernel. Anything else
++// WindowServer draws - the snapshot a minimized window leaves in the Dock, a screenshot - can be read by the CPU or another
++// process as soon as this call returns, so it waits for completion as before (minimized windows showed only the app badge).
++static BOOL nvmtl_wsw_draws_scanout(NVMTLCommandBuffer *cb) {
++    NSMutableSet *ids = [NSMutableSet new];
++    void (^add)(id) = ^(id o) {
++        if (![o isKindOfClass:[NVMTLTexture class]]) return;
++        NVMTLTexture *t = o, *r = t->_parent ? t->_parent : t;
++        if (r->_surf) [ids addObject:@(IOSurfaceGetID(r->_surf))];
++    };
++    for (id t in cb->_surfDirty) add(t);
++    for (id t in cb->_rshPend) add(t);
++    for (NVMTLSubmissionPart *part in cb->_parts) for (id t in part->surfaces) add(t);
++    for (NSNumber *n in ids) if (nvmtl_vk_wsw_op(4, n.unsignedIntValue) == 0x4e565731u) return YES;
++    return NO;
++}
+ - (BOOL)commitAndWaitUntilSubmitted {
+     static int ws = -1;
+     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+-    if (ws && !_committed && nvmtl_wsw_on()) {
++    if (ws && !_committed && nvmtl_wsw_on() && nvmtl_wsw_draws_scanout(self)) {
+         static _Atomic uint32_t wswNext;
+         uint32_t seq = atomic_fetch_add(&wswNext, 1) + 1;
+         if (!seq) seq = atomic_fetch_add(&wswNext, 1) + 1;
+-- 
+2.50.1 (Apple Git-155)
+

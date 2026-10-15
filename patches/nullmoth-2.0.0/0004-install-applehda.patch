@@ -1,0 +1,40 @@
+--- a/install.sh
++++ b/install.sh
+@@ -13,6 +13,11 @@
+ # --allow-missing-kdk. The auxiliary collection only links against the boot and system collections already on disk.
+ KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")
+ KB=/System/Library/KernelCollections/BootKernelExtensions.kc
++# LOCAL (this Mac): built-in audio is AppleHDA from the macOS 15 KDK in /Library/Apple/System/Library/Extensions, which
++# kmutil only links into the auxiliary collection when named with -b (same recipe as ~/hackintosh stage13/18/20).
++HDA_IDS="com.apple.driver.AppleHDA com.apple.driver.AppleHDAController com.apple.driver.AppleHDAHardwareConfigDriver com.apple.driver.DspFuncLib com.apple.iokit.IOHDAFamily"
++HDAB=(); if [ -d /Library/Apple/System/Library/Extensions/AppleHDA.kext ]; then
++  HDAB+=(--repository /Library/Apple/System/Library/Extensions); for b in $HDA_IDS; do HDAB+=(-b "$b"); done; else HDA_IDS=""; fi
+ KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
+ BK=""; LOCKDIR=/Library/NullMoth/install.lock; LOCK_HELD=0; LOCK_RELEASE_OK=1; LOCK_ID=""
+ INSTALLING=0; NEWKC=""
+@@ -199,10 +204,11 @@
+ for k in $KEXTS; do cp -R "$(kpath $k)" "$T/repo/" || die "copy $k"; done
+ # macOS 26 kmutil silently skips kexts not owned by root ("No binaries or codeless kexts were provided").
+ chown -R root:wheel "$T/repo" && chmod -R go-w "$T/repo" || die "preflight kext permissions"
+-kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$T/repo" -A "$T/aux.kc" -z >"$T/kmutil.log" 2>&1 || { tail -20 "$T/kmutil.log"; die "test kernel collection build failed"; }
++kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} ${HDAB[@]+"${HDAB[@]}"} -B $KB -S $KS --repository "$T/repo" -A "$T/aux.kc" -z >"$T/kmutil.log" 2>&1 || { tail -20 "$T/kmutil.log"; die "test kernel collection build failed"; }
+ [ -s "$T/aux.kc" ] || die "test kernel collection build produced no output"
+ INS=$(kmutil inspect -a x86_64 -A "$T/aux.kc" 2>/dev/null) || die "cannot inspect the test kernel collection"
+ for k in $KEXTS; do printf '%s\n' "$INS" | grep -oE 'com\.nullmoth\.[A-Za-z0-9]+' | grep -Fxq "com.nullmoth.$k" || { tail -20 "$T/kmutil.log"; die "kmutil refused com.nullmoth.$k (log above)"; }; done
++for b in $HDA_IDS; do printf '%s\n' "$INS" | grep -oE '[A-Za-z0-9.]+' | grep -Fxq "$b" || { tail -20 "$T/kmutil.log"; die "test collection lacks $b (built-in audio)"; }; done
+ ok "test collection holds all four kexts"
+ [ "${CHECK:-0}" = 1 ] && { rm -rf "$T"; echo; echo "CHECK PASS (nothing changed)"; exit 0; }
+ 
+@@ -313,10 +319,11 @@
+ chown -R _windowserver:wheel "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shader cache owner"
+ chmod 0755 "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shared shader cache permissions"
+ NEWKC="$KC.nullmoth-install-new"; rm -f "$NEWKC"
+-kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 || die "live kernel collection build failed (restore from $BK)"
++kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} ${HDAB[@]+"${HDAB[@]}"} -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 || die "live kernel collection build failed (restore from $BK)"
+ [ -s "$NEWKC" ] || die "live kernel collection build produced no output (restore from $BK)"
+ INS=$(kmutil inspect -a x86_64 -A "$NEWKC" 2>/dev/null) || die "cannot inspect the new kernel collection (restore from $BK)"
+ for k in $KEXTS; do printf '%s\n' "$INS" | grep -oE 'com\.nullmoth\.[A-Za-z0-9]+' | grep -Fxq "com.nullmoth.$k" || die "com.nullmoth.$k missing from the new collection (restore from $BK)"; done
++for b in $HDA_IDS; do printf '%s\n' "$INS" | grep -oE '[A-Za-z0-9.]+' | grep -Fxq "$b" || die "$b (built-in audio) missing from the new collection (restore from $BK)"; done
+ mv -f "$NEWKC" "$KC" || die "cannot publish the new kernel collection (restore from $BK)"
+ INSTALLING=0
+ rm -rf "$T"

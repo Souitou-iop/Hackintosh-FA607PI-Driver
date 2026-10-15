@@ -1,0 +1,198 @@
+From 44a8d0e7f2d3dd47a326180313bd989c8b717b45 Mon Sep 17 00:00:00 2001
+From: Souitou-iop <Souitou-iop@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:23:33 +0800
+Subject: [PATCH] VRAM import cache: textures over one IOSurface share its
+ import for 500 ms (desktop-switch stutter)
+
+---
+ plugin/NVMTLDevice.m  | 126 ++++++++++++++++++++++++++++++++++++++++--
+ plugin/NVMTLObjects.h |   3 +-
+ plugin/NVMTLObjects.m |   2 +-
+ 3 files changed, 125 insertions(+), 6 deletions(-)
+
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index cc2ff50..949beb0 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -741,6 +741,123 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
+     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
+     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
+ }
++// Local (VRAM import cache): every texture made over a shared-VRAM IOSurface imported the surface's VRAM again - an RM
++// GPU-VA allocation and a DMA mapping, two kernel round trips. Core Animation re-wraps the same flatten-cache surfaces
++// many times a second while desktops slide, which put this import at ~37% of WindowServer's display updates. One import
++// per surface is now shared by its textures and kept for NVMTL_VIMP_MS (default 500 ms) after its last use, so a re-wrap
++// only creates an image over it. Kept imports hold their IOSurface; at most NVMTL_VIMP_MB (default 256) MB are kept.
++// NVMTL_VIMP_CACHE=0: old behaviour.
++// A kept import is only reused while NVAccel has freed no VRAM since it was made (debug.nvaccel_vm_dealloc unchanged): the
++// family may give a surface new VRAM after freeing its old one, and a kept import would still point at the old block.
++typedef struct nvmtl_vimp { struct nvmtl_vimp *next; IOSurfaceRef surf; uint32_t id; size_t need; nvk_buffer vb;
++                            _Atomic int refs; int cached; uint64_t last; int64_t gen; } nvmtl_vimp;
++static nvmtl_vimp *g_vimp; static os_unfair_lock g_vimpLock = OS_UNFAIR_LOCK_INIT;
++static unsigned g_vimpCount; static size_t g_vimpBytes; static int g_vimpTimer;
++static _Atomic unsigned long long g_vimpHit, g_vimpMiss, g_vimpEvict, g_vimpStale;
++static int64_t nvmtl_vimp_gen(void) {   // -1: the counter cannot be read, keep nothing
++    int64_t v = 0; size_t n = sizeof v;
++    return sysctlbyname("debug.nvaccel_vm_dealloc", &v, &n, NULL, 0) == 0 && n == sizeof v ? v : -1;
++}
++static int nvmtl_vimp_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_VIMP_CACHE"); on = !(e && e[0] == '0');
++        nvdiag_emit("VRAM import cache %s (NVMTL_VIMP_CACHE=%s)", on ? "ON - textures over one IOSurface share its VRAM import" : "off", e ?: "unset"); }
++    return on;
++}
++static uint64_t nvmtl_vimp_ttl_ns(void) {
++    static long ms = -1; if (ms < 0) { const char *e = getenv("NVMTL_VIMP_MS"); ms = e && *e ? atol(e) : 500; if (ms < 0) ms = 0; }
++    return (uint64_t)ms * 1000000ull;
++}
++static size_t nvmtl_vimp_cap(void) {
++    static long mb = -1; if (mb < 0) { const char *e = getenv("NVMTL_VIMP_MB"); mb = e && *e ? atol(e) : 256; if (mb < 0) mb = 0; }
++    return (size_t)mb << 20;
++}
++static void nvmtl_vimp_free(nvmtl_vimp *p) {
++    nvmtl_vk_buffer_destroy(&p->vb);
++    if (p->surf) CFRelease(p->surf);
++    free(p);
++}
++void nvmtl_vimp_put(void *imp) {
++    nvmtl_vimp *p = (nvmtl_vimp *)imp;
++    if (p && atomic_fetch_sub(&p->refs, 1) == 1) nvmtl_vimp_free(p);
++}
++// Caller holds g_vimpLock. Unlinks expired entries (all of them when 'all') onto *drop; their cache reference is dropped later.
++static void nvmtl_vimp_trim_locked(uint64_t now, int all, nvmtl_vimp **drop) {
++    const uint64_t ttl = nvmtl_vimp_ttl_ns(); const size_t cap = nvmtl_vimp_cap(); size_t kept = 0;
++    for (nvmtl_vimp **pp = &g_vimp; *pp; ) {
++        nvmtl_vimp *p = *pp;
++        // the list is newest-use first: once the kept bytes pass the cap, everything further back goes
++        if (all || now - p->last > ttl || kept + p->need > cap) {
++            *pp = p->next; p->cached = 0; g_vimpCount--; g_vimpBytes -= p->need; p->next = *drop; *drop = p;
++            atomic_fetch_add(&g_vimpEvict, 1);
++        } else { kept += p->need; pp = &p->next; }
++    }
++}
++static void nvmtl_vimp_drop(nvmtl_vimp *drop) { while (drop) { nvmtl_vimp *n = drop->next; nvmtl_vimp_put(drop); drop = n; } }
++static void nvmtl_vimp_arm_timer(void);
++static void nvmtl_vimp_tick(void) {
++    nvmtl_vimp *drop = NULL; int again;
++    os_unfair_lock_lock(&g_vimpLock);
++    nvmtl_vimp_trim_locked(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), 0, &drop);
++    again = g_vimp != NULL; g_vimpTimer = again;
++    os_unfair_lock_unlock(&g_vimpLock);
++    nvmtl_vimp_drop(drop);
++    if (again) nvmtl_vimp_arm_timer();
++}
++static void nvmtl_vimp_arm_timer(void) {
++    static dispatch_queue_t q; static dispatch_once_t once;
++    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.vimp", DISPATCH_QUEUE_SERIAL); });
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)nvmtl_vimp_ttl_ns() + 100000000), q, ^{ nvmtl_vimp_tick(); });
++}
++// A shared import of the surface's VRAM (one reference for the caller), or NULL when the family refuses it.
++static nvmtl_vimp *nvmtl_vimp_get(IOSurfaceRef surf, uint32_t id, size_t need) {
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    const int64_t gen = nvmtl_vimp_on() ? nvmtl_vimp_gen() : -1;
++    if (gen >= 0) {
++        nvmtl_vimp *drop = NULL;
++        os_unfair_lock_lock(&g_vimpLock);
++        nvmtl_vimp *prev = NULL, *hit = NULL;
++        for (nvmtl_vimp *p = g_vimp; p; prev = p, p = p->next)
++            if (p->surf == surf && p->id == id && p->need == need) { hit = p; break; }
++        if (hit && hit->gen != gen) {   // VRAM was freed somewhere since: import again
++            if (prev) prev->next = hit->next; else g_vimp = hit->next;
++            hit->cached = 0; g_vimpCount--; g_vimpBytes -= hit->need; hit->next = NULL; drop = hit; hit = NULL;
++            atomic_fetch_add(&g_vimpStale, 1);
++        }
++        if (hit) {
++            atomic_fetch_add(&hit->refs, 1); hit->last = now;
++            if (prev) { prev->next = hit->next; hit->next = g_vimp; g_vimp = hit; }
++        }
++        os_unfair_lock_unlock(&g_vimpLock);
++        nvmtl_vimp_drop(drop);
++        if (hit) {
++            const unsigned long long h = atomic_fetch_add(&g_vimpHit, 1) + 1;
++            if (h == 1 || h % 2000 == 0) nvdiag_emit("VRAM import cache: %llu hits, %llu imports (%llu after VRAM was freed), %llu released (%u kept, %zu MB)", h,
++                                                   (unsigned long long)atomic_load(&g_vimpMiss), (unsigned long long)atomic_load(&g_vimpStale),
++                                                   (unsigned long long)atomic_load(&g_vimpEvict), g_vimpCount, g_vimpBytes >> 20);
++            return hit;
++        }
++    }
++    nvk_buffer vb;
++    if (nvmtl_vk_surface_vram(id, 0, need, &vb)) return NULL;
++    atomic_fetch_add(&g_vimpMiss, 1);
++    nvmtl_vimp *p = (nvmtl_vimp *)calloc(1, sizeof *p);
++    if (!p) { nvmtl_vk_buffer_destroy(&vb); return NULL; }
++    p->surf = surf; CFRetain(surf); p->id = id; p->need = need; p->vb = vb; p->last = now; p->gen = gen;
++    atomic_store(&p->refs, 1);
++    if (gen >= 0 && need <= nvmtl_vimp_cap()) {
++        nvmtl_vimp *drop = NULL; int arm = 0;
++        atomic_fetch_add(&p->refs, 1); p->cached = 1;
++        os_unfair_lock_lock(&g_vimpLock);
++        p->next = g_vimp; g_vimp = p; g_vimpCount++; g_vimpBytes += need;
++        nvmtl_vimp_trim_locked(now, 0, &drop);
++        if (!g_vimpTimer && g_vimp) { g_vimpTimer = 1; arm = 1; }
++        os_unfair_lock_unlock(&g_vimpLock);
++        nvmtl_vimp_drop(drop);
++        if (arm) nvmtl_vimp_arm_timer();
++    }
++    return p;
++}
+ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
+ {
+@@ -755,10 +872,11 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && bigEnough && nvmtl_vk_surface_share_on()) {
+         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
+         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
+-            nvk_buffer vb;
+-            if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
++            nvmtl_vimp *imp = nvmtl_vimp_get(surf, IOSurfaceGetID(surf), row * h);
++            if (imp) {
++                nvk_buffer vb = imp->vb;
+                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
++                    t->_vramBuf = vb; t->_vramImp = imp; t->_vramOn = YES; g_surf_vram++;
+                     uint32_t seed = IOSurfaceGetSeed(surf);
+                     int current = nvmtl_vram_tag_current(surf, 0, seed);
+                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+@@ -770,7 +888,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
+                     return 0;
+                 }
+-                nvmtl_vk_buffer_destroy(&vb);
++                nvmtl_vimp_put(imp);
+             }
+         }
+     }
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index fa6a564..184d162 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -44,7 +44,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return
+   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
+   uint32_t _baseSlice, _baseLevel;
+   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+-  nvk_buffer _vramBuf; BOOL _vramOn;
++  nvk_buffer _vramBuf; BOOL _vramOn; void *_vramImp;   // _vramImp: shared import (nvmtl_vimp) that owns _vramBuf
+   BOOL _dirtyPending;   // this process marked the surface VRAM-newest: NVAccel holds it in its pending table (upstream #143)
+   nvk_image _selfShadow; BOOL _selfShadowOn;   // same-pass feedback-loop guard: private copy of a shared attachment
+   nvk_image _rsh; BOOL _rshOn;   // tiled render shadow: render encoders draw a shared-VRAM (linear) surface here
+@@ -321,3 +321,4 @@ extern unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1
+ @end
+ 
+ NSDictionary *nvmtl_index_argument_fields(NSArray *fields);
++void nvmtl_vimp_put(void *imp);
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 6a1175a..4d2f3b4 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -1209,7 +1209,7 @@ - (void)dealloc {
+     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+     if (!_parent) nvmtl_vk_image_destroy(&_i);
+     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
+-    if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
++    if (!_parent && _vramOn) { if (_vramImp) { nvmtl_vimp_put(_vramImp); _vramImp = NULL; } else nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+     if (!_parent && _surf && _dirtyPending) nvmtl_surface_release_pending(_surf);
+     if (!_parent && _selfShadowOn) { nvmtl_vk_image_destroy(&_selfShadow); _selfShadowOn = NO; }
+     if (!_parent && _rshOn) { nvmtl_vk_rsh_release(&_rsh); _rshOn = NO; }
+-- 
+2.50.1 (Apple Git-155)
+
